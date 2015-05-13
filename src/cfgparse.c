@@ -2106,7 +2106,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		rc = PR_CAP_LISTEN;
  	else if (!strcmp(args[0], "frontend"))
 		rc = PR_CAP_FE | PR_CAP_RS;
- 	else if (!strcmp(args[0], "backend"))
+	else if (!strcmp(args[0], "backend"))
 		rc = PR_CAP_BE | PR_CAP_RS;
  	else if (!strcmp(args[0], "ruleset"))
 		rc = PR_CAP_RS;
@@ -4683,22 +4683,43 @@ stats_error_parsing:
 		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
-		if (strcmp(args[1], "connect") == 0) {
+		if (strcmp(args[1], "comment") == 0) {
+			int cur_arg;
+			struct tcpcheck_rule *tcpcheck;
+
+			cur_arg = 1;
+			tcpcheck = (struct tcpcheck_rule *)calloc(1, sizeof(*tcpcheck));
+			tcpcheck->action = TCPCHK_ACT_COMMENT;
+
+			if (!*args[cur_arg + 1]) {
+				Alert("parsing [%s:%d] : '%s' expects a comment string.\n",
+					file, linenum, args[cur_arg]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			tcpcheck->comment = strdup(args[cur_arg + 1]);
+
+			LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
+		}
+		else if (strcmp(args[1], "connect") == 0) {
 			const char *ptr_arg;
 			int cur_arg;
 			struct tcpcheck_rule *tcpcheck;
-			struct list *l;
 
 			/* check if first rule is also a 'connect' action */
-			l = (struct list *)&curproxy->tcpcheck_rules;
-			if (l->p != l->n) {
-				tcpcheck = (struct tcpcheck_rule *)l->n;
-				if (tcpcheck && tcpcheck->action != TCPCHK_ACT_CONNECT) {
-					Alert("parsing [%s:%d] : first step MUST also be a 'connect' when there is a 'connect' step in the tcp-check ruleset.\n",
-					      file, linenum);
-					err_code |= ERR_ALERT | ERR_FATAL;
-					goto out;
-				}
+			tcpcheck = LIST_NEXT(&curproxy->tcpcheck_rules, struct tcpcheck_rule *, list);
+			while (&tcpcheck->list != &curproxy->tcpcheck_rules &&
+			       tcpcheck->action == TCPCHK_ACT_COMMENT) {
+				tcpcheck = LIST_NEXT(&tcpcheck->list, struct tcpcheck_rule *, list);
+			}
+
+			if (&tcpcheck->list != &curproxy->tcpcheck_rules
+			    && tcpcheck->action != TCPCHK_ACT_CONNECT) {
+				Alert("parsing [%s:%d] : first step MUST also be a 'connect' when there is a 'connect' step in the tcp-check ruleset.\n",
+				      file, linenum);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
 			}
 
 			cur_arg = 2;
@@ -4731,11 +4752,22 @@ stats_error_parsing:
 					cur_arg++;
 				}
 #endif /* USE_OPENSSL */
+				/* comment for this tcpcheck line */
+				else if (strcmp(args[cur_arg], "comment") == 0) {
+					if (!*args[cur_arg + 1]) {
+						Alert("parsing [%s:%d] : '%s' expects a comment string.\n",
+							file, linenum, args[cur_arg]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->comment = strdup(args[cur_arg + 1]);
+					cur_arg += 2;
+				}
 				else {
 #ifdef USE_OPENSSL
-					Alert("parsing [%s:%d] : '%s %s' expects 'port', 'send-proxy' or 'ssl' but got '%s' as argument.\n",
+					Alert("parsing [%s:%d] : '%s %s' expects 'comment', 'port', 'send-proxy' or 'ssl' but got '%s' as argument.\n",
 #else /* USE_OPENSSL */
-					Alert("parsing [%s:%d] : '%s %s' expects 'port', 'send-proxy' or but got '%s' as argument.\n",
+					Alert("parsing [%s:%d] : '%s %s' expects 'comment', 'port', 'send-proxy' or but got '%s' as argument.\n",
 #endif /* USE_OPENSSL */
 					      file, linenum, args[0], args[1], args[cur_arg]);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -4763,6 +4795,17 @@ stats_error_parsing:
 				tcpcheck->string = strdup(args[2]);
 				tcpcheck->expect_regex = NULL;
 
+				/* comment for this tcpcheck line */
+				if (strcmp(args[3], "comment") == 0) {
+					if (!*args[4]) {
+						Alert("parsing [%s:%d] : '%s' expects a comment string.\n",
+							file, linenum, args[3]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->comment = strdup(args[4]);
+				}
+
 				LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
 			}
 		}
@@ -4787,6 +4830,17 @@ stats_error_parsing:
 					goto out;
 				}
 				tcpcheck->expect_regex = NULL;
+
+				/* comment for this tcpcheck line */
+				if (strcmp(args[3], "comment") == 0) {
+					if (!*args[4]) {
+						Alert("parsing [%s:%d] : '%s' expects a comment string.\n",
+							file, linenum, args[3]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->comment = strdup(args[4]);
+				}
 
 				LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
 			}
@@ -4839,6 +4893,18 @@ stats_error_parsing:
 				tcpcheck->expect_regex = NULL;
 				tcpcheck->inverse = inverse;
 
+				/* tcpcheck comment */
+				cur_arg += 2;
+				if (strcmp(args[cur_arg], "comment") == 0) {
+					if (!*args[cur_arg + 1]) {
+						Alert("parsing [%s:%d] : '%s' expects a comment string.\n",
+							file, linenum, args[cur_arg + 1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->comment = strdup(args[cur_arg + 1]);
+				}
+
 				LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
 			}
 			else if (strcmp(ptr_arg, "string") == 0) {
@@ -4858,6 +4924,18 @@ stats_error_parsing:
 				tcpcheck->string = strdup(args[cur_arg + 1]);
 				tcpcheck->expect_regex = NULL;
 				tcpcheck->inverse = inverse;
+
+				/* tcpcheck comment */
+				cur_arg += 2;
+				if (strcmp(args[cur_arg], "comment") == 0) {
+					if (!*args[cur_arg + 1]) {
+						Alert("parsing [%s:%d] : '%s' expects a comment string.\n",
+							file, linenum, args[cur_arg + 1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->comment = strdup(args[cur_arg + 1]);
+				}
 
 				LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
 			}
@@ -4887,6 +4965,18 @@ stats_error_parsing:
 				}
 				tcpcheck->inverse = inverse;
 
+				/* tcpcheck comment */
+				cur_arg += 2;
+				if (strcmp(args[cur_arg], "comment") == 0) {
+					if (!*args[cur_arg + 1]) {
+						Alert("parsing [%s:%d] : '%s' expects a comment string.\n",
+							file, linenum, args[cur_arg + 1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					tcpcheck->comment = strdup(args[cur_arg + 1]);
+				}
+
 				LIST_ADDQ(&curproxy->tcpcheck_rules, &tcpcheck->list);
 			}
 			else {
@@ -4897,7 +4987,7 @@ stats_error_parsing:
 			}
 		}
 		else {
-			Alert("parsing [%s:%d] : '%s' only supports 'connect', 'send' or 'expect'.\n", file, linenum, args[0]);
+			Alert("parsing [%s:%d] : '%s' only supports 'comment', 'connect', 'send' or 'expect'.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -6179,12 +6269,19 @@ out:
  */
 int readcfgfile(const char *file)
 {
-	char thisline[LINESIZE];
+	char *thisline;
+	int linesize = LINESIZE;
 	FILE *f;
 	int linenum = 0;
 	int err_code = 0;
 	struct cfg_section *cs = NULL;
 	struct cfg_section *ics;
+	int readbytes = 0;
+
+	if ((thisline = malloc(sizeof(*thisline) * linesize)) == NULL) {
+		Alert("parsing [%s] : out of memory.\n", file);
+		return -1;
+	}
 
 	/* Register internal sections */
 	if (!cfg_register_section("listen",   cfg_parse_listen) ||
@@ -6202,7 +6299,8 @@ int readcfgfile(const char *file)
 	if ((f=fopen(file,"r")) == NULL)
 		return -1;
 
-	while (fgets(thisline, sizeof(thisline), f) != NULL) {
+next_line:
+	while (fgets(thisline + readbytes, linesize - readbytes, f) != NULL) {
 		int arg, kwm = KWM_STD;
 		char *end;
 		char *args[MAX_LINE_ARGS + 1];
@@ -6214,14 +6312,28 @@ int readcfgfile(const char *file)
 
 		end = line + strlen(line);
 
-		if (end-line == sizeof(thisline)-1 && *(end-1) != '\n') {
+		if (end-line == linesize-1 && *(end-1) != '\n') {
 			/* Check if we reached the limit and the last char is not \n.
 			 * Watch out for the last line without the terminating '\n'!
 			 */
-			Alert("parsing [%s:%d]: line too long, limit: %d.\n",
-			      file, linenum, (int)sizeof(thisline)-1);
-			err_code |= ERR_ALERT | ERR_FATAL;
+			char *newline;
+			int newlinesize = linesize * 2;
+
+			newline = realloc(thisline, sizeof(*thisline) * newlinesize);
+			if (newline == NULL) {
+				Alert("parsing [%s:%d]: line too long, cannot allocate memory.\n",
+				      file, linenum);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				continue;
+			}
+
+			readbytes = linesize - 1;
+			linesize = newlinesize;
+			thisline = newline;
+			continue;
 		}
+
+		readbytes = 0;
 
 		/* skip leading spaces */
 		while (isspace((unsigned char)*line))
@@ -6236,7 +6348,7 @@ int readcfgfile(const char *file)
 					dquote = 0;
 				else
 					dquote = 1;
-				memmove(line, line + 1, end - (line + 1));
+				memmove(line, line + 1, end - line);
 				end--;
 			}
 			else if (*line == '\'' && !dquote) { /* single quote outside double quotes */
@@ -6244,7 +6356,7 @@ int readcfgfile(const char *file)
 					squote = 0;
 				else
 					squote = 1;
-				memmove(line, line + 1, end - (line + 1));
+				memmove(line, line + 1, end - line);
 				end--;
 			}
 			else if (*line == '\\' && !squote) {
@@ -6288,6 +6400,9 @@ int readcfgfile(const char *file)
 				} else if (line[1] == '\'') {
 					*line = '\'';
 					skip = 1;
+				} else if (line[1] == '$' && dquote) { /* escaping of $ only inside double quotes */
+					*line = '$';
+					skip = 1;
 				}
 				if (skip) {
 					memmove(line + 1, line + 1 + skip, end - (line + skip));
@@ -6307,10 +6422,95 @@ int readcfgfile(const char *file)
 					line++;
 				args[++arg] = line;
 			}
+			else if (dquote && *line == '$') {
+				/* environment variables are evaluated inside double quotes */
+				char *var_beg;
+				char *var_end;
+				char save_char;
+				char *value;
+				int val_len;
+				int newlinesize;
+				int braces = 0;
+
+				var_beg = line + 1;
+				var_end = var_beg;
+
+				if (*var_beg == '{') {
+					var_beg++;
+					var_end++;
+					braces = 1;
+				}
+
+				if (!isalpha((int)(unsigned char)*var_beg) && *var_beg != '_') {
+					Alert("parsing [%s:%d] : Variable expansion: Unrecognized character '%c' in variable name.\n", file, linenum, *var_beg);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto next_line; /* skip current line */
+				}
+
+				while (isalnum((int)(unsigned char)*var_end) || *var_end == '_')
+					var_end++;
+
+				save_char = *var_end;
+				*var_end = '\0';
+				value = getenv(var_beg);
+				*var_end = save_char;
+				val_len = value ? strlen(value) : 0;
+
+				if (braces) {
+					if (*var_end == '}') {
+						var_end++;
+						braces = 0;
+					} else {
+						Alert("parsing [%s:%d] : Variable expansion: Mismatched braces.\n", file, linenum);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto next_line; /* skip current line */
+					}
+				}
+
+				newlinesize = (end - thisline) - (var_end - line) + val_len + 1;
+
+				/* if not enough space in thisline */
+				if (newlinesize  > linesize) {
+					char *newline;
+
+					newline = realloc(thisline, newlinesize * sizeof(*thisline));
+					if (newline == NULL) {
+						Alert("parsing [%s:%d] : Variable expansion: Not enough memory.\n", file, linenum);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto next_line; /* slip current line */
+					}
+					/* recompute pointers if realloc returns a new pointer */
+					if (newline != thisline) {
+						int i;
+						int diff;
+
+						for (i = 0; i <= arg; i++) {
+							diff = args[i] - thisline;
+							args[i] = newline + diff;
+						}
+
+						diff = var_end - thisline;
+						var_end = newline + diff;
+						diff = end - thisline;
+						end = newline + diff;
+						diff = line - thisline;
+						line = newline + diff;
+						thisline = newline;
+					}
+					linesize = newlinesize;
+				}
+
+				/* insert value inside the line */
+				memmove(line + val_len, var_end, end - var_end + 1);
+				memcpy(line, value, val_len);
+				end += val_len - (var_end - line);
+				line += val_len;
+			}
 			else {
 				line++;
 			}
 		}
+
 		if (dquote) {
 			Alert("parsing [%s:%d] : Mismatched double quotes.\n", file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -6391,6 +6591,7 @@ int readcfgfile(const char *file)
 			break;
 	}
 	cursection = NULL;
+	free(thisline);
 	fclose(f);
 	return err_code;
 }
