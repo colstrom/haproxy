@@ -17,5 +17,5 @@ deployment:
   package:
     branch: master
     commands:
-      - package_cloud push colstrom/haproxy/ubuntu/precise `ls -1 *.deb`
+      - package_cloud push colstrom/haproxy-devel/ubuntu/precise `ls -1 *.deb`
 
