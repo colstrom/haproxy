@@ -1,0 +1,21 @@
+---
+checkout:
+  post:
+    - git fetch --unshallow
+dependencies:
+  post:
+    - gem install fpm package_cloud
+test:
+  post:
+    - make TARGET=linux2628 CPU=native USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE=1
+    - strip haproxy haproxy-systemd-wrapper
+    - mkdir -p usr/sbin
+    - mv haproxy haproxy-systemd-wrapper usr/sbin
+    - fpm -s dir -t deb -n haproxy -v `git describe --tags` -d libssl1.0.0 -d libpcrecpp0 -d zlib1g usr
+    - cp *.deb $CIRCLE_ARTIFACTS
+deployment:
+  package:
+    branch: master
+    commands:
+      - package_cloud push colstrom/haproxy/ubuntu/precise `ls -1 *.deb`
+
