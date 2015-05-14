@@ -1,7 +1,7 @@
 ---
 checkout:
   post:
-    - git fetch --unshallow
+    - git fetch --unshallow || true
 dependencies:
   post:
     - gem install fpm package_cloud
