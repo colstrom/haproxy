@@ -115,6 +115,10 @@ enum {
 int sslconns = 0;
 int totalsslconns = 0;
 
+#if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
+struct list tlskeys_reference = LIST_HEAD_INIT(tlskeys_reference);
+#endif
+
 #ifndef OPENSSL_NO_DH
 static DH *local_dh_1024 = NULL;
 static DH *local_dh_2048 = NULL;
@@ -406,8 +410,8 @@ static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned
 	int i;
 
 	conn = (struct connection *)SSL_get_app_data(s);
-	keys = objt_listener(conn->target)->bind_conf->tls_ticket_keys;
-	head = objt_listener(conn->target)->bind_conf->tls_ticket_enc_index;
+	keys = objt_listener(conn->target)->bind_conf->keys_ref->tlskeys;
+	head = objt_listener(conn->target)->bind_conf->keys_ref->tls_ticket_enc_index;
 
 	if (enc) {
 		memcpy(key_name, keys[head].name, 16);
@@ -436,6 +440,88 @@ static int ssl_tlsext_ticket_key_cb(SSL *s, unsigned char key_name[16], unsigned
 		return i ? 2 : 1;
 	}
 }
+
+struct tls_keys_ref *tlskeys_ref_lookup(const char *filename)
+{
+        struct tls_keys_ref *ref;
+
+        list_for_each_entry(ref, &tlskeys_reference, list)
+                if (ref->filename && strcmp(filename, ref->filename) == 0)
+                        return ref;
+        return NULL;
+}
+
+struct tls_keys_ref *tlskeys_ref_lookupid(int unique_id)
+{
+        struct tls_keys_ref *ref;
+
+        list_for_each_entry(ref, &tlskeys_reference, list)
+                if (ref->unique_id == unique_id)
+                        return ref;
+        return NULL;
+}
+
+int ssl_sock_update_tlskey(char *filename, struct chunk *tlskey, char **err) {
+	struct tls_keys_ref *ref = tlskeys_ref_lookup(filename);
+
+	if(!ref) {
+		memprintf(err, "Unable to locate the referenced filename: %s", filename);
+		return 1;
+	}
+
+	memcpy((char *) (ref->tlskeys + 2 % TLS_TICKETS_NO), tlskey->str, tlskey->len);
+	ref->tls_ticket_enc_index = ref->tls_ticket_enc_index + 1 % TLS_TICKETS_NO;
+
+	return 0;
+}
+
+/* This function finalize the configuration parsing. Its set all the
+ * automatic ids
+ */
+void tlskeys_finalize_config(void)
+{
+	int i = 0;
+	struct tls_keys_ref *ref, *ref2, *ref3;
+	struct list tkr = LIST_HEAD_INIT(tkr);
+
+	list_for_each_entry(ref, &tlskeys_reference, list) {
+		if (ref->unique_id == -1) {
+			/* Look for the first free id. */
+			while (1) {
+				list_for_each_entry(ref2, &tlskeys_reference, list) {
+					if (ref2->unique_id == i) {
+						i++;
+						break;
+					}
+				}
+				if (&ref2->list == &tlskeys_reference)
+					break;
+			}
+
+			/* Uses the unique id and increment it for the next entry. */
+			ref->unique_id = i;
+			i++;
+		}
+	}
+
+	/* This sort the reference list by id. */
+	list_for_each_entry_safe(ref, ref2, &tlskeys_reference, list) {
+		LIST_DEL(&ref->list);
+		list_for_each_entry(ref3, &tkr, list) {
+			if (ref->unique_id < ref3->unique_id) {
+				LIST_ADDQ(&ref3->list, &ref->list);
+				break;
+			}
+		}
+		if (&ref3->list == &tkr)
+			LIST_ADDQ(&tkr, &ref->list);
+	}
+
+	/* swap root */
+	LIST_ADD(&tkr, &tlskeys_reference);
+	LIST_DEL(&tkr);
+}
+
 #endif /* SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB */
 
 /*
@@ -1783,7 +1869,7 @@ int ssl_sock_prepare_ctx(struct bind_conf *bind_conf, SSL_CTX *ctx, struct proxy
 	}
 
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
-	if(bind_conf->tls_ticket_keys) {
+	if(bind_conf->keys_ref) {
 		if (!SSL_CTX_set_tlsext_ticket_key_cb(ctx, ssl_tlsext_ticket_key_cb)) {
 			Alert("Proxy '%s': unable to set callback for TLS ticket validation for bind '%s' at [%s:%d].\n",
 				curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line);
@@ -3630,6 +3716,19 @@ smp_fetch_ssl_fc_has_sni(const struct arg *args, struct sample *smp, const char 
 #endif
 }
 
+/* boolean, returns true if client session has been resumed */
+static int
+smp_fetch_ssl_fc_is_resumed(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct connection *conn = objt_conn(smp->sess->origin);
+
+	smp->type = SMP_T_BOOL;
+	smp->data.uint = (conn && conn->xprt == &ssl_sock) &&
+		conn->xprt_ctx &&
+		SSL_session_reused(conn->xprt_ctx);
+	return 1;
+}
+
 /* string, returns the used cipher if front conn. transport layer is SSL.
  * This function is also usable on backend conn if the fetch keyword 5th
  * char is 'b'.
@@ -4332,6 +4431,7 @@ static int bind_parse_tls_ticket_keys(char **args, int cur_arg, struct proxy *px
 	FILE *f;
 	int i = 0;
 	char thisline[LINESIZE];
+	struct tls_keys_ref *keys_ref;
 
 	if (!*args[cur_arg + 1]) {
 		if (err)
@@ -4339,13 +4439,22 @@ static int bind_parse_tls_ticket_keys(char **args, int cur_arg, struct proxy *px
 		return ERR_ALERT | ERR_FATAL;
 	}
 
-	conf->tls_ticket_keys = malloc(TLS_TICKETS_NO * sizeof(struct tls_sess_key));
+	keys_ref = tlskeys_ref_lookup(args[cur_arg + 1]);
+	if(keys_ref) {
+		conf->keys_ref = keys_ref;
+		return 0;
+	}
+
+	keys_ref = malloc(sizeof(struct tls_keys_ref));
+	keys_ref->tlskeys = malloc(TLS_TICKETS_NO * sizeof(struct tls_sess_key));
 
 	if ((f = fopen(args[cur_arg + 1], "r")) == NULL) {
 		if (err)
 			memprintf(err, "'%s' : unable to load ssl tickets keys file", args[cur_arg+1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
+
+	keys_ref->filename = strdup(args[cur_arg + 1]);
 
 	while (fgets(thisline, sizeof(thisline), f) != NULL) {
 		int len = strlen(thisline);
@@ -4356,7 +4465,7 @@ static int bind_parse_tls_ticket_keys(char **args, int cur_arg, struct proxy *px
 		if(thisline[len - 1] == '\r')
 			thisline[--len] = 0;
 
-		if (base64dec(thisline, len, (char *) (conf->tls_ticket_keys + i % TLS_TICKETS_NO), sizeof(struct tls_sess_key)) != sizeof(struct tls_sess_key)) {
+		if (base64dec(thisline, len, (char *) (keys_ref->tlskeys + i % TLS_TICKETS_NO), sizeof(struct tls_sess_key)) != sizeof(struct tls_sess_key)) {
 			if (err)
 				memprintf(err, "'%s' : unable to decode base64 key on line %d", args[cur_arg+1], i + 1);
 			return ERR_ALERT | ERR_FATAL;
@@ -4374,7 +4483,11 @@ static int bind_parse_tls_ticket_keys(char **args, int cur_arg, struct proxy *px
 
 	/* Use penultimate key for encryption, handle when TLS_TICKETS_NO = 1 */
 	i-=2;
-	conf->tls_ticket_enc_index = i < 0 ? 0 : i;
+	keys_ref->tls_ticket_enc_index = i < 0 ? 0 : i;
+	keys_ref->unique_id = -1;
+	conf->keys_ref = keys_ref;
+
+	LIST_ADD(&tlskeys_reference, &keys_ref->list);
 
 	return 0;
 #else
@@ -4776,6 +4889,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "ssl_fc_cipher",          smp_fetch_ssl_fc_cipher,      0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 	{ "ssl_fc_has_crt",         smp_fetch_ssl_fc_has_crt,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 	{ "ssl_fc_has_sni",         smp_fetch_ssl_fc_has_sni,     0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
+	{ "ssl_fc_is_resumed",      smp_fetch_ssl_fc_is_resumed,  0,                   NULL,    SMP_T_BOOL, SMP_USE_L5CLI },
 #ifdef OPENSSL_NPN_NEGOTIATED
 	{ "ssl_fc_npn",             smp_fetch_ssl_fc_npn,         0,                   NULL,    SMP_T_STR,  SMP_USE_L5CLI },
 #endif

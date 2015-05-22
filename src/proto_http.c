@@ -11488,7 +11488,7 @@ smp_fetch_cookie_val(const struct arg *args, struct sample *smp, const char *kw,
  *
  * Example: if path = "/foo/bar/fubar?yo=mama;ye=daddy", and n = 22:
  *
- * find_query_string(path, n) points to "yo=mama;ye=daddy" string.
+ * find_query_string(path, n, '?') points to "yo=mama;ye=daddy" string.
  */
 static inline char *find_param_list(char *path, size_t path_l, char delim)
 {
@@ -11503,98 +11503,365 @@ static inline int is_param_delimiter(char c, char delim)
 	return c == '&' || c == ';' || c == delim;
 }
 
+/* after increasing a pointer value, it can exceed the first buffer
+ * size. This function transform the value of <ptr> according with
+ * the expected position. <chunks> is an array of the one or two
+ * avalaible chunks. The first value is the start of the first chunk,
+ * the second value if the end+1 of the first chunks. The third value
+ * is NULL or the start of the second chunk and the fourth value is
+ * the end+1 of the second chunk. The function returns 1 if does a
+ * wrap, else returns 0.
+ */
+static inline int fix_pointer_if_wrap(const char **chunks, const char **ptr)
+{
+	if (*ptr < chunks[1])
+		return 0;
+	if (!chunks[2])
+		return 0;
+	*ptr = chunks[2] + ( *ptr - chunks[1] );
+	return 1;
+}
+
 /*
  * Given a url parameter, find the starting position of the first occurence,
  * or NULL if the parameter is not found.
  *
  * Example: if query_string is "yo=mama;ye=daddy" and url_param_name is "ye",
  * the function will return query_string+8.
+ *
+ * Warning:this function returns a pointer that can be point to the first chunk
+ * or the second chunk. The caller must be check the position before using the
+ * result.
  */
-static char*
-find_url_param_pos(char* query_string, size_t query_string_l,
-                   char* url_param_name, size_t url_param_name_l,
+static const char *
+find_url_param_pos(const char **chunks,
+                   const char* url_param_name, size_t url_param_name_l,
                    char delim)
 {
-	char *pos, *last;
+	const char *pos, *last, *equal;
+	const char **bufs = chunks;
+	int l1, l2;
 
-	pos  = query_string;
-	last = query_string + query_string_l - url_param_name_l - 1;
 
+	pos  = bufs[0];
+	last = bufs[1];
 	while (pos <= last) {
-		if (pos[url_param_name_l] == '=') {
-			if (memcmp(pos, url_param_name, url_param_name_l) == 0)
-				return pos;
-			pos += url_param_name_l + 1;
+		/* Check the equal. */
+		equal = pos + url_param_name_l;
+		if (fix_pointer_if_wrap(chunks, &equal)) {
+			if (equal >= chunks[3])
+				return NULL;
+		} else {
+			if (equal >= chunks[1])
+				return NULL;
 		}
-		while (pos <= last && !is_param_delimiter(*pos, delim))
-			pos++;
+		if (*equal == '=') {
+			if (pos + url_param_name_l > last) {
+				/* process wrap case, we detect a wrap. In this case, the
+				 * comparison is performed in two parts.
+				 */
+
+				/* This is the end, we dont have any other chunk. */
+				if (bufs != chunks || !bufs[2])
+					return NULL;
+
+				/* Compute the length of each part of the comparison. */
+				l1 = last - pos;
+				l2 = url_param_name_l - l1;
+
+				/* The second buffer is too short to contain the compared string. */
+				if (bufs[2] + l2 > bufs[3])
+					return NULL;
+
+				if (memcmp(pos,     url_param_name,    l1) == 0 &&
+				    memcmp(bufs[2], url_param_name+l1, l2) == 0)
+					return pos;
+
+				/* Perform wrapping and jump the string who fail the comparison. */
+				bufs += 2;
+				pos = bufs[0] + l2;
+				last = bufs[1];
+
+			} else {
+				/* process a simple comparison. */
+				if (memcmp(pos, url_param_name, url_param_name_l) == 0) {
+					return pos; }
+				pos += url_param_name_l + 1;
+				if (fix_pointer_if_wrap(chunks, &pos))
+					last = bufs[2];
+			}
+		}
+
+		while (1) {
+			/* Look for the next delimiter. */
+			while (pos <= last && !is_param_delimiter(*pos, delim))
+				pos++;
+			if (pos < last)
+				break;
+			/* process buffer wrapping. */
+			if (bufs != chunks || !bufs[2])
+				return NULL;
+			bufs += 2;
+			pos = bufs[0];
+			last = bufs[1];
+		}
 		pos++;
 	}
 	return NULL;
 }
 
 /*
- * Given a url parameter name, returns its value and size into *value and
- * *value_l respectively, and returns non-zero. If the parameter is not found,
- * zero is returned and value/value_l are not touched.
+ * Given a url parameter name and a query string, returns its value and size
+ * into *value and *value_l respectively, and returns non-zero. An empty
+ * url_param_name matches the first available parameter. If the parameter is
+ * not found, zero is returned and value/value_l are not touched.
  */
 static int
-find_url_param_value(char* path, size_t path_l,
-                     char* url_param_name, size_t url_param_name_l,
-                     char** value, int* value_l, char delim)
+find_next_url_param(const char **chunks,
+                    const char* url_param_name, size_t url_param_name_l,
+                    const char **vstart, const char **vend, char delim)
 {
-	char *query_string, *qs_end;
-	char *arg_start;
-	char *value_start, *value_end;
+	const char *arg_start, *qs_end;
+	const char *value_start, *value_end;
 
-	query_string = find_param_list(path, path_l, delim);
-	if (!query_string)
-		return 0;
-
-	qs_end = path + path_l;
-	arg_start = find_url_param_pos(query_string, qs_end - query_string,
-                                      url_param_name, url_param_name_l,
-                                      delim);
+	arg_start = chunks[0];
+	qs_end = chunks[1];
+	if (url_param_name_l) {
+		/* Looks for an argument name. */
+		arg_start = find_url_param_pos(chunks,
+		                               url_param_name, url_param_name_l,
+		                               delim);
+		/* Check for wrapping. */
+		if (arg_start > qs_end)
+			qs_end = chunks[3];
+	}
 	if (!arg_start)
 		return 0;
 
-	value_start = arg_start + url_param_name_l + 1;
+	if (!url_param_name_l) {
+		while (1) {
+			/* looks for the first argument. */
+			value_start = memchr(arg_start, '=', qs_end - arg_start);
+			if (!value_start) {
+
+				/* Check for wrapping. */
+				if (arg_start >= chunks[0] &&
+				    arg_start <= chunks[1] &&
+				    chunks[2]) {
+					arg_start = chunks[2];
+					qs_end = chunks[3];
+					continue;
+				}
+				return 0;
+			}
+			break;
+		}
+		value_start++;
+	}
+	else {
+		/* Jump the argument length. */
+		value_start = arg_start + url_param_name_l + 1;
+
+		/* Check for pointer wrapping. */
+		if (fix_pointer_if_wrap(chunks, &value_start)) {
+			/* Update the end pointer. */
+			qs_end = chunks[3];
+
+			/* Check for overflow. */
+			if (value_start > qs_end)
+				return 0;
+		}
+	}
+
 	value_end = value_start;
 
-	while ((value_end < qs_end) && !is_param_delimiter(*value_end, delim))
-		value_end++;
+	while (1) {
+		while ((value_end < qs_end) && !is_param_delimiter(*value_end, delim))
+			value_end++;
+		if (value_end < qs_end)
+			break;
+		/* process buffer wrapping. */
+		if (value_end >= chunks[0] &&
+		    value_end <= chunks[1] &&
+		    chunks[2]) {
+			value_end = chunks[2];
+			qs_end = chunks[3];
+			continue;
+		}
+		break;
+	}
 
-	*value = value_start;
-	*value_l = value_end - value_start;
+	*vstart = value_start;
+	*vend = value_end;
 	return value_end != value_start;
 }
 
+/* This scans a URL-encoded query string. It takes an optionally wrapping
+ * string whose first contigous chunk has its beginning in ctx->a[0] and end
+ * in ctx->a[1], and the optional second part in (ctx->a[2]..ctx->a[3]). The
+ * pointers are updated for next iteration before leaving.
+ */
+static int
+smp_fetch_param(char delim, const char *name, int name_len, const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	const char *vstart, *vend;
+	struct chunk *temp;
+	const char **chunks = (const char **)smp->ctx.a;
+
+	if (!find_next_url_param(chunks,
+	                         name, name_len,
+	                         &vstart, &vend,
+	                         delim))
+		return 0;
+
+	/* Create sample. If the value is contiguous, return the pointer as CONST,
+	 * if the value is wrapped, copy-it in a buffer.
+	 */
+	smp->type = SMP_T_STR;
+	if (chunks[2] &&
+	    vstart >= chunks[0] && vstart <= chunks[1] &&
+	    vend >= chunks[2] && vend <= chunks[3]) {
+		/* Wrapped case. */
+		temp = get_trash_chunk();
+		memcpy(temp->str, vstart, chunks[1] - vstart);
+		memcpy(temp->str + ( chunks[1] - vstart ), chunks[2], vend - chunks[2]);
+		smp->data.str.str = temp->str;
+		smp->data.str.len = ( chunks[1] - vstart ) + ( vend - chunks[2] );
+	} else {
+		/* Contiguous case. */
+		smp->data.str.str = (char *)vstart;
+		smp->data.str.len = vend - vstart;
+		smp->flags = SMP_F_VOL_1ST | SMP_F_CONST;
+	}
+
+	/* Update context, check wrapping. */
+	chunks[0] = vend;
+	if (chunks[2] && vend >= chunks[2] && vend <= chunks[3]) {
+		chunks[1] = chunks[3];
+		chunks[2] = NULL;
+	}
+
+	if (chunks[0] < chunks[1])
+		smp->flags |= SMP_F_NOT_LAST;
+
+	return 1;
+}
+
+/* This function iterates over each parameter of the query string. It uses
+ * ctx->a[0] and ctx->a[1] to store the beginning and end of the current
+ * parameter. Since it uses smp_fetch_param(), ctx->a[2..3] are both NULL.
+ * An optional parameter name is passed in args[0], otherwise any parameter is
+ * considered. It supports an optional delimiter argument for the beginning of
+ * the string in args[1], which defaults to "?".
+ */
 static int
 smp_fetch_url_param(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	char delim = '?';
 	struct http_msg *msg;
+	char delim = '?';
+	const char *name;
+	int name_len;
 
-	if (!args || args[0].type != ARGT_STR ||
-	    (args[1].type && args[1].type != ARGT_STR))
+	if (!smp->ctx.a[0]) { // first call, find the query string
+		if (!args ||
+		    (args[0].type && args[0].type != ARGT_STR) ||
+		    (args[1].type && args[1].type != ARGT_STR))
+			return 0;
+
+		if (args[1].type)
+			delim = *args[1].data.str.str;
+
+		name = "";
+		name_len = 0;
+		if (args->type == ARGT_STR) {
+			name     = args->data.str.str;
+			name_len = args->data.str.len;
+		}
+
+		CHECK_HTTP_MESSAGE_FIRST();
+
+		msg = &smp->strm->txn->req;
+
+		smp->ctx.a[0] = find_param_list(msg->chn->buf->p + msg->sl.rq.u,
+		                                msg->sl.rq.u_l, delim);
+		if (!smp->ctx.a[0])
+			return 0;
+
+		smp->ctx.a[1] = msg->chn->buf->p + msg->sl.rq.u + msg->sl.rq.u_l;
+
+		/* Assume that the context is filled with NULL pointer
+		 * before the first call.
+		 * smp->ctx.a[2] = NULL;
+		 * smp->ctx.a[3] = NULL;
+		 */
+	}
+
+	return smp_fetch_param(delim, name, name_len, args, smp, kw, private);
+}
+
+/* This function iterates over each parameter of the body. This requires
+ * that the body has been waited for using http-buffer-request. It uses
+ * ctx->a[0] and ctx->a[1] to store the beginning and end of the first
+ * contigous part of the body, and optionally ctx->a[2..3] to reference the
+ * optional second part if the body wraps at the end of the buffer. An optional
+ * parameter name is passed in args[0], otherwise any parameter is considered.
+ */
+static int
+smp_fetch_body_param(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+	struct http_txn *txn = smp->strm->txn;
+	struct http_msg *msg;
+	unsigned long len;
+	unsigned long block1;
+	char *body;
+	const char *name;
+	int name_len;
+
+	if (!args || (args[0].type && args[0].type != ARGT_STR))
 		return 0;
 
-	CHECK_HTTP_MESSAGE_FIRST();
+	name = "";
+	name_len = 0;
+	if (args[0].type == ARGT_STR) {
+		name     = args[0].data.str.str;
+		name_len = args[0].data.str.len;
+	}
 
-	msg = &smp->strm->txn->req;
+	if (!smp->ctx.a[0]) { // first call, find the query string
+		CHECK_HTTP_MESSAGE_FIRST();
 
-	if (args[1].type)
-		delim = *args[1].data.str.str;
+		if ((smp->opt & SMP_OPT_DIR) == SMP_OPT_DIR_REQ)
+			msg = &txn->req;
+		else
+			msg = &txn->rsp;
 
-	if (!find_url_param_value(msg->chn->buf->p + msg->sl.rq.u, msg->sl.rq.u_l,
-                                 args->data.str.str, args->data.str.len,
-                                 &smp->data.str.str, &smp->data.str.len,
-                                 delim))
-		return 0;
+		len  = http_body_bytes(msg);
+		body = b_ptr(msg->chn->buf, -http_data_rewind(msg));
 
-	smp->type = SMP_T_STR;
-	smp->flags = SMP_F_VOL_1ST | SMP_F_CONST;
-	return 1;
+		block1 = len;
+		if (block1 > msg->chn->buf->data + msg->chn->buf->size - body)
+			block1 = msg->chn->buf->data + msg->chn->buf->size - body;
+
+		if (block1 == len) {
+			/* buffer is not wrapped (or empty) */
+			smp->ctx.a[0] = body;
+			smp->ctx.a[1] = body + len;
+
+			/* Assume that the context is filled with NULL pointer
+			 * before the first call.
+			 * smp->ctx.a[2] = NULL;
+			 * smp->ctx.a[3] = NULL;
+			*/
+		}
+		else {
+			/* buffer is wrapped, we need to defragment it */
+			smp->ctx.a[0] = body;
+			smp->ctx.a[1] = body + block1;
+			smp->ctx.a[2] = msg->chn->buf->data;
+			smp->ctx.a[3] = msg->chn->buf->data + ( len - block1 );
+		}
+	}
+	return smp_fetch_param('&', name, name_len, args, smp, kw, private);
 }
 
 /* Return the signed integer value for the specified url parameter (see url_param
@@ -12417,6 +12684,7 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "req.body",        smp_fetch_body,           0,                NULL,    SMP_T_BIN,  SMP_USE_HRQHV },
 	{ "req.body_len",    smp_fetch_body_len,       0,                NULL,    SMP_T_UINT, SMP_USE_HRQHV },
 	{ "req.body_size",   smp_fetch_body_size,      0,                NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "req.body_param",  smp_fetch_body_param,     ARG1(0,STR),      NULL,    SMP_T_BIN,  SMP_USE_HRQHV },
 
 	/* HTTP version on the response path */
 	{ "res.ver",         smp_fetch_stver,          0,                NULL,    SMP_T_STR,  SMP_USE_HRSHV },
@@ -12466,9 +12734,9 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "url32+src",       smp_fetch_url32_src,      0,                NULL,    SMP_T_BIN,  SMP_USE_HRQHV },
 	{ "url_ip",          smp_fetch_url_ip,         0,                NULL,    SMP_T_IPV4, SMP_USE_HRQHV },
 	{ "url_port",        smp_fetch_url_port,       0,                NULL,    SMP_T_UINT, SMP_USE_HRQHV },
-	{ "url_param",       smp_fetch_url_param,      ARG2(1,STR,STR),  NULL,    SMP_T_STR,  SMP_USE_HRQHV },
-	{ "urlp"     ,       smp_fetch_url_param,      ARG2(1,STR,STR),  NULL,    SMP_T_STR,  SMP_USE_HRQHV },
-	{ "urlp_val",        smp_fetch_url_param_val,  ARG2(1,STR,STR),  NULL,    SMP_T_UINT, SMP_USE_HRQHV },
+	{ "url_param",       smp_fetch_url_param,      ARG2(0,STR,STR),  NULL,    SMP_T_STR,  SMP_USE_HRQHV },
+	{ "urlp"     ,       smp_fetch_url_param,      ARG2(0,STR,STR),  NULL,    SMP_T_STR,  SMP_USE_HRQHV },
+	{ "urlp_val",        smp_fetch_url_param_val,  ARG2(0,STR,STR),  NULL,    SMP_T_UINT, SMP_USE_HRQHV },
 	{ /* END */ },
 }};
 
