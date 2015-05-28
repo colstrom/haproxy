@@ -866,7 +866,7 @@ static void stats_sock_table_request(struct stream_interface *si, char **args, i
 	appctx->st0 = action;
 
 	if (*args[2]) {
-		appctx->ctx.table.target = find_stktable(args[2]);
+		appctx->ctx.table.target = proxy_tbl_by_name(args[2]);
 		if (!appctx->ctx.table.target) {
 			appctx->ctx.cli.msg = "No such table\n";
 			appctx->st0 = STAT_CLI_PRINT;
@@ -924,7 +924,7 @@ static struct proxy *expect_frontend_admin(struct stream *s, struct stream_inter
 		return NULL;
 	}
 
-	px = findproxy(arg, PR_CAP_FE);
+	px = proxy_fe_by_name(arg);
 	if (!px) {
 		appctx->ctx.cli.msg = "No such frontend.\n";
 		appctx->st0 = STAT_CLI_PRINT;
@@ -3329,6 +3329,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 			chunk_appendf(&trash, "<td class=ac>-</td></tr>\n");
 	}
 	else { /* CSV mode */
+		struct chunk *out = get_trash_chunk();
 		static char *srv_hlt_st[SRV_STATS_STATE_COUNT] = {
 			[SRV_STATS_STATE_DOWN]			= "DOWN,",
 			[SRV_STATS_STATE_DOWN_AGENT]		= "DOWN (agent),",
@@ -3426,7 +3427,7 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 
 		if (sv->check.state & CHK_ST_ENABLED) {
 			/* check_status */
-			chunk_appendf(&trash, "%s,", get_check_status_info(sv->check.status));
+			chunk_appendf(&trash, "%s,", csv_enc(get_check_status_info(sv->check.status), 1, out));
 
 			/* check_code */
 			if (sv->check.status >= HCHK_STATUS_L57DATA)
@@ -3471,8 +3472,8 @@ static int stats_dump_sv_stats(struct stream_interface *si, struct proxy *px, in
 		chunk_appendf(&trash, "%d,", srv_lastsession(sv));
 
 		/* capture of last check and agent statuses */
-		chunk_appendf(&trash, "%s,", ((sv->check.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? cstr(sv->check.desc) : "");
-		chunk_appendf(&trash, "%s,", ((sv->agent.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? cstr(sv->agent.desc) : "");
+		chunk_appendf(&trash, "%s,", ((sv->check.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? csv_enc(cstr(sv->check.desc), 1, out) : "");
+		chunk_appendf(&trash, "%s,", ((sv->agent.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED) ? csv_enc(cstr(sv->agent.desc), 1, out) : "");
 
 		/* qtime, ctime, rtime, ttime, */
 		chunk_appendf(&trash, "%u,%u,%u,%u,",
@@ -4622,7 +4623,7 @@ static int stats_process_http_post(struct stream_interface *si)
 
 			/* Now we can check the key to see what to do */
 			if (!px && (strcmp(key, "b") == 0)) {
-				if ((px = findproxy(value, PR_CAP_BE)) == NULL) {
+				if ((px = proxy_be_by_name(value)) == NULL) {
 					/* the backend name is unknown or ambiguous (duplicate names) */
 					appctx->ctx.stats.st_code = STAT_STATUS_ERRP;
 					goto out;

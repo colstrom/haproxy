@@ -3680,13 +3680,15 @@ resume_execution:
 }
 
 
-/* Executes the http-response rules <rules> for stream <s>, proxy <px> and
- * transaction <txn>. Returns 3 states: HTTP_RULE_RES_CONT, HTTP_RULE_RES_YIELD
- * or HTTP_RULE_RES_STOP. If *CONT is returned, the process can continue the
- * evaluation of next rule list. If *STOP is returned, the process must stop
- * the evaluation. It may set the TX_SVDENY on txn->flags if it encounters a deny
- * rule. If *YIELD is returned, the czller must call again the function with
- * the same context.
+/* Executes the http-response rules <rules> for stream <s> and proxy <px>. It
+ * returns one of 5 possible statuses: HTTP_RULE_RES_CONT, HTTP_RULE_RES_STOP,
+ * HTTP_RULE_RES_DONE, HTTP_RULE_RES_YIELD, or HTTP_RULE_RES_BADREQ. If *CONT
+ * is returned, the process can continue the evaluation of next rule list. If
+ * *STOP or *DONE is returned, the process must stop the evaluation. If *BADREQ
+ * is returned, it means the operation could not be processed and a server error
+ * must be returned. It may set the TX_SVDENY on txn->flags if it encounters a
+ * deny rule. If *YIELD is returned, the caller must call again the function
+ * with the same context.
  */
 static enum rule_result
 http_res_get_intercept_rule(struct proxy *px, struct list *rules, struct stream *s)
@@ -3879,6 +3881,11 @@ resume_execution:
 			break;
 			}
 
+		case HTTP_RES_ACT_REDIR:
+			if (!http_apply_redirect_rule(rule->arg.redir, s, txn))
+				return HTTP_RULE_RES_BADREQ;
+			return HTTP_RULE_RES_DONE;
+
 		case HTTP_RES_ACT_CUSTOM_CONT:
 			if (!rule->action_ptr(rule, px, s)) {
 				s->current_rule = rule;
@@ -3903,7 +3910,8 @@ resume_execution:
  */
 static int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct http_txn *txn)
 {
-	struct http_msg *msg = &txn->req;
+	struct http_msg *req = &txn->req;
+	struct http_msg *res = &txn->rsp;
 	const char *msg_fmt;
 	const char *location;
 
@@ -3943,7 +3951,7 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s
 		host = "";
 		hostlen = 0;
 		ctx.idx = 0;
-		if (http_find_header2("Host", 4, txn->req.chn->buf->p, &txn->hdr_idx, &ctx)) {
+		if (http_find_header2("Host", 4, req->chn->buf->p, &txn->hdr_idx, &ctx)) {
 			host = ctx.line + ctx.val;
 			hostlen = ctx.vlen;
 		}
@@ -3951,7 +3959,7 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s
 		path = http_get_path(txn);
 		/* build message using path */
 		if (path) {
-			pathlen = txn->req.sl.rq.u_l + (txn->req.chn->buf->p + txn->req.sl.rq.u) - path;
+			pathlen = req->sl.rq.u_l + (req->chn->buf->p + req->sl.rq.u) - path;
 			if (rule->flags & REDIRECT_FLAG_DROP_QS) {
 				int qs = 0;
 				while (qs < pathlen) {
@@ -4014,7 +4022,7 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s
 		path = http_get_path(txn);
 		/* build message using path */
 		if (path) {
-			pathlen = txn->req.sl.rq.u_l + (txn->req.chn->buf->p + txn->req.sl.rq.u) - path;
+			pathlen = req->sl.rq.u_l + (req->chn->buf->p + req->sl.rq.u) - path;
 			if (rule->flags & REDIRECT_FLAG_DROP_QS) {
 				int qs = 0;
 				while (qs < pathlen) {
@@ -4107,12 +4115,12 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s
 	s->logs.tv_request = now;
 
 	if (*location == '/' &&
-	    (msg->flags & HTTP_MSGF_XFER_LEN) &&
-	    !(msg->flags & HTTP_MSGF_TE_CHNK) && !txn->req.body_len &&
+	    (req->flags & HTTP_MSGF_XFER_LEN) &&
+	    ((!(req->flags & HTTP_MSGF_TE_CHNK) && !req->body_len) || (req->msg_state == HTTP_MSG_DONE)) &&
 	    ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL ||
 	     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL)) {
 		/* keep-alive possible */
-		if (!(msg->flags & HTTP_MSGF_VER_11)) {
+		if (!(req->flags & HTTP_MSGF_VER_11)) {
 			if (unlikely(txn->flags & TX_USE_PX_CONN)) {
 				memcpy(trash.str + trash.len, "\r\nProxy-Connection: keep-alive", 30);
 				trash.len += 30;
@@ -4123,15 +4131,18 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s
 		}
 		memcpy(trash.str + trash.len, "\r\n\r\n", 4);
 		trash.len += 4;
-		bo_inject(txn->rsp.chn, trash.str, trash.len);
+		bo_inject(res->chn, trash.str, trash.len);
 		/* "eat" the request */
-		bi_fast_delete(txn->req.chn->buf, msg->sov);
-		msg->next -= msg->sov;
-		msg->sov = 0;
-		txn->req.chn->analysers = AN_REQ_HTTP_XFER_BODY;
+		bi_fast_delete(req->chn->buf, req->sov);
+		req->next -= req->sov;
+		req->sov = 0;
+		s->req.analysers = AN_REQ_HTTP_XFER_BODY;
 		s->res.analysers = AN_RES_HTTP_XFER_BODY;
-		txn->req.msg_state = HTTP_MSG_CLOSED;
-		txn->rsp.msg_state = HTTP_MSG_DONE;
+		req->msg_state = HTTP_MSG_CLOSED;
+		res->msg_state = HTTP_MSG_DONE;
+		/* Trim any possible response */
+		res->chn->buf->i = 0;
+		res->next = res->sov = 0;
 	} else {
 		/* keep-alive not possible */
 		if (unlikely(txn->flags & TX_USE_PX_CONN)) {
@@ -4142,7 +4153,7 @@ static int http_apply_redirect_rule(struct redirect_rule *rule, struct stream *s
 			trash.len += 23;
 		}
 		stream_int_retnclose(&s->si[0], &trash);
-		txn->req.chn->analysers = 0;
+		req->chn->analysers = 0;
 	}
 
 	if (!(s->flags & SF_ERR_MASK))
@@ -6490,8 +6501,18 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 		struct proxy *rule_set = cur_proxy;
 
 		/* evaluate http-response rules */
-		if (ret == HTTP_RULE_RES_CONT)
+		if (ret == HTTP_RULE_RES_CONT) {
 			ret = http_res_get_intercept_rule(cur_proxy, &cur_proxy->http_res_rules, s);
+
+			if (ret == HTTP_RULE_RES_BADREQ)
+				goto return_srv_prx_502;
+
+			if (ret == HTTP_RULE_RES_DONE) {
+				rep->analysers &= ~an_bit;
+				rep->analyse_exp = TICK_ETERNITY;
+				return 1;
+			}
+		}
 
 		/* we need to be called again. */
 		if (ret == HTTP_RULE_RES_YIELD) {
@@ -7127,19 +7148,6 @@ int apply_filter_to_req_headers(struct stream *s, struct channel *req, struct hd
 
 		if (regex_exec_match2(exp->preg, cur_ptr, cur_end-cur_ptr, MAX_MATCH, pmatch, 0)) {
 			switch (exp->action) {
-			case ACT_SETBE:
-				/* It is not possible to jump a second time.
-				 * FIXME: should we return an HTTP/500 here so that
-				 * the admin knows there's a problem ?
-				 */
-				if (s->be != strm_fe(s))
-					break;
-
-				/* Swithing Proxy */
-				stream_set_backend(s, (struct proxy *)exp->replace);
-				last_hdr = 1;
-				break;
-
 			case ACT_ALLOW:
 				txn->flags |= TX_CLALLOW;
 				last_hdr = 1;
@@ -7228,19 +7236,6 @@ int apply_filter_to_req_line(struct stream *s, struct channel *req, struct hdr_e
 
 	if (regex_exec_match2(exp->preg, cur_ptr, cur_end-cur_ptr, MAX_MATCH, pmatch, 0)) {
 		switch (exp->action) {
-		case ACT_SETBE:
-			/* It is not possible to jump a second time.
-			 * FIXME: should we return an HTTP/500 here so that
-			 * the admin knows there's a problem ?
-			 */
-			if (s->be != strm_fe(s))
-				break;
-
-			/* Swithing Proxy */
-			stream_set_backend(s, (struct proxy *)exp->replace);
-			done = 1;
-			break;
-
 		case ACT_ALLOW:
 			txn->flags |= TX_CLALLOW;
 			done = 1;
@@ -9394,7 +9389,7 @@ struct http_req_rule *parse_http_req_cond(const char **args, const char *file, i
 		struct redirect_rule *redir;
 		char *errmsg = NULL;
 
-		if ((redir = http_parse_redirect_rule(file, linenum, proxy, (const char **)args + 1, &errmsg, 1)) == NULL) {
+		if ((redir = http_parse_redirect_rule(file, linenum, proxy, (const char **)args + 1, &errmsg, 1, 0)) == NULL) {
 			Alert("parsing [%s:%d] : error detected in %s '%s' while parsing 'http-request %s' rule : %s.\n",
 			      file, linenum, proxy_type_str(proxy), proxy->id, args[0], errmsg);
 			goto out_err;
@@ -9862,6 +9857,25 @@ struct http_res_rule *parse_http_res_cond(const char **args, const char *file, i
 		proxy->conf.lfs_line = proxy->conf.args.line;
 
 		cur_arg += 2;
+	} else if (strcmp(args[0], "redirect") == 0) {
+		struct redirect_rule *redir;
+		char *errmsg = NULL;
+
+		if ((redir = http_parse_redirect_rule(file, linenum, proxy, (const char **)args + 1, &errmsg, 1, 1)) == NULL) {
+			Alert("parsing [%s:%d] : error detected in %s '%s' while parsing 'http-response %s' rule : %s.\n",
+			      file, linenum, proxy_type_str(proxy), proxy->id, args[0], errmsg);
+			goto out_err;
+		}
+
+		/* this redirect rule might already contain a parsed condition which
+		 * we'll pass to the http-request rule.
+		 */
+		rule->action = HTTP_RES_ACT_REDIR;
+		rule->arg.redir = redir;
+		rule->cond = redir->cond;
+		redir->cond = NULL;
+		cur_arg = 2;
+		return rule;
 	} else if (((custom = action_http_res_custom(args[0])) != NULL)) {
 		char *errmsg = NULL;
 		cur_arg = 1;
@@ -9905,10 +9919,11 @@ struct http_res_rule *parse_http_res_cond(const char **args, const char *file, i
 
 /* Parses a redirect rule. Returns the redirect rule on success or NULL on error,
  * with <err> filled with the error message. If <use_fmt> is not null, builds a
- * dynamic log-format rule instead of a static string.
+ * dynamic log-format rule instead of a static string. Parameter <dir> indicates
+ * the direction of the rule, and equals 0 for request, non-zero for responses.
  */
 struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, struct proxy *curproxy,
-                                               const char **args, char **errmsg, int use_fmt)
+                                               const char **args, char **errmsg, int use_fmt, int dir)
 {
 	struct redirect_rule *rule;
 	int cur_arg;
@@ -9933,7 +9948,6 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 		else if (strcmp(args[cur_arg], "prefix") == 0) {
 			if (!*args[cur_arg + 1])
 				goto missing_arg;
-
 			type = REDIRECT_TYPE_PREFIX;
 			cur_arg++;
 			destination = args[cur_arg];
@@ -10004,6 +10018,11 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 		return NULL;
 	}
 
+	if (dir && type != REDIRECT_TYPE_LOCATION) {
+		memprintf(errmsg, "response only supports redirect type 'location'");
+		return NULL;
+	}
+
 	rule = (struct redirect_rule *)calloc(1, sizeof(*rule));
 	rule->cond = cond;
 	LIST_INIT(&rule->rdr_fmt);
@@ -10023,7 +10042,8 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 		curproxy->conf.args.ctx = ARGC_RDR;
 		if (!(type == REDIRECT_TYPE_PREFIX && destination[0] == '/' && destination[1] == '\0')) {
 			parse_logformat_string(destination, curproxy, &rule->rdr_fmt, LOG_OPT_HTTP,
-			                       (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+			                       dir ? (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRS_HDR : SMP_VAL_BE_HRS_HDR
+			                           : (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
 					       file, linenum);
 			free(curproxy->conf.lfs_file);
 			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
@@ -11762,22 +11782,22 @@ smp_fetch_url_param(const struct arg *args, struct sample *smp, const char *kw, 
 	const char *name;
 	int name_len;
 
+	if (!args ||
+	    (args[0].type && args[0].type != ARGT_STR) ||
+	    (args[1].type && args[1].type != ARGT_STR))
+		return 0;
+
+	name = "";
+	name_len = 0;
+	if (args->type == ARGT_STR) {
+		name     = args->data.str.str;
+		name_len = args->data.str.len;
+	}
+
+	if (args[1].type)
+		delim = *args[1].data.str.str;
+
 	if (!smp->ctx.a[0]) { // first call, find the query string
-		if (!args ||
-		    (args[0].type && args[0].type != ARGT_STR) ||
-		    (args[1].type && args[1].type != ARGT_STR))
-			return 0;
-
-		if (args[1].type)
-			delim = *args[1].data.str.str;
-
-		name = "";
-		name_len = 0;
-		if (args->type == ARGT_STR) {
-			name     = args->data.str.str;
-			name_len = args->data.str.len;
-		}
-
 		CHECK_HTTP_MESSAGE_FIRST();
 
 		msg = &smp->strm->txn->req;
@@ -12208,6 +12228,88 @@ static int sample_conv_url_dec(const struct arg *args, struct sample *smp, void 
 	return 1;
 }
 
+static int smp_conv_req_capture(const struct arg *args, struct sample *smp, void *private)
+{
+	struct proxy *fe = strm_fe(smp->strm);
+	int idx, i;
+	struct cap_hdr *hdr;
+	int len;
+
+	if (!args || args->type != ARGT_UINT)
+		return 0;
+
+	idx = args->data.uint;
+
+	/* Check the availibity of the capture id. */
+	if (idx > fe->nb_req_cap - 1)
+		return 0;
+
+	/* Look for the original configuration. */
+	for (hdr = fe->req_cap, i = fe->nb_req_cap - 1;
+	     hdr != NULL && i != idx ;
+	     i--, hdr = hdr->next);
+	if (!hdr)
+		return 0;
+
+	/* check for the memory allocation */
+	if (smp->strm->req_cap[hdr->index] == NULL)
+		smp->strm->req_cap[hdr->index] = pool_alloc2(hdr->pool);
+	if (smp->strm->req_cap[hdr->index] == NULL)
+		return 0;
+
+	/* Check length. */
+	len = smp->data.str.len;
+	if (len > hdr->len)
+		len = hdr->len;
+
+	/* Capture input data. */
+	memcpy(smp->strm->req_cap[idx], smp->data.str.str, len);
+	smp->strm->req_cap[idx][len] = '\0';
+
+	return 1;
+}
+
+static int smp_conv_res_capture(const struct arg *args, struct sample *smp, void *private)
+{
+	struct proxy *fe = strm_fe(smp->strm);
+	int idx, i;
+	struct cap_hdr *hdr;
+	int len;
+
+	if (!args || args->type != ARGT_UINT)
+		return 0;
+
+	idx = args->data.uint;
+
+	/* Check the availibity of the capture id. */
+	if (idx > fe->nb_rsp_cap - 1)
+		return 0;
+
+	/* Look for the original configuration. */
+	for (hdr = fe->rsp_cap, i = fe->nb_rsp_cap - 1;
+	     hdr != NULL && i != idx ;
+	     i--, hdr = hdr->next);
+	if (!hdr)
+		return 0;
+
+	/* check for the memory allocation */
+	if (smp->strm->res_cap[hdr->index] == NULL)
+		smp->strm->res_cap[hdr->index] = pool_alloc2(hdr->pool);
+	if (smp->strm->res_cap[hdr->index] == NULL)
+		return 0;
+
+	/* Check length. */
+	len = smp->data.str.len;
+	if (len > hdr->len)
+		len = hdr->len;
+
+	/* Capture input data. */
+	memcpy(smp->strm->res_cap[idx], smp->data.str.str, len);
+	smp->strm->res_cap[idx][len] = '\0';
+
+	return 1;
+}
+
 /* This function executes one of the set-{method,path,query,uri} actions. It
  * takes the string from the variable 'replace' with length 'len', then modifies
  * the relevant part of the request line accordingly. Then it updates various
@@ -12408,9 +12510,52 @@ int http_action_req_capture(struct http_req_rule *rule, struct proxy *px, struct
 	return 1;
 }
 
+/* This function executes the "capture" action and store the result in a
+ * capture slot if exists. It executes a fetch expression, turns the result
+ * into a string and puts it in a capture slot. It always returns 1. If an
+ * error occurs the action is cancelled, but the rule processing continues.
+ */
+int http_action_req_capture_by_id(struct http_req_rule *rule, struct proxy *px, struct stream *s)
+{
+	struct session *sess = s->sess;
+	struct sample *key;
+	struct sample_expr *expr = rule->arg.act.p[0];
+	struct cap_hdr *h;
+	int idx = (long)rule->arg.act.p[1];
+	char **cap = s->req_cap;
+	struct proxy *fe = strm_fe(s);
+	int len;
+	int i;
+
+	/* Look for the original configuration. */
+	for (h = fe->req_cap, i = fe->nb_req_cap - 1;
+	     h != NULL && i != idx ;
+	     i--, h = h->next);
+	if (!h)
+		return 1;
+
+	key = sample_fetch_string(s->be, sess, s, SMP_OPT_DIR_REQ|SMP_OPT_FINAL, expr);
+	if (!key)
+		return 1;
+
+	if (cap[h->index] == NULL)
+		cap[h->index] = pool_alloc2(h->pool);
+
+	if (cap[h->index] == NULL) /* no more capture memory */
+		return 1;
+
+	len = key->data.str.len;
+	if (len > h->len)
+		len = h->len;
+
+	memcpy(cap[h->index], key->data.str.str, len);
+	cap[h->index][len] = 0;
+	return 1;
+}
+
 /* parse an "http-request capture" action. It takes a single argument which is
  * a sample fetch expression. It stores the expression into arg->act.p[0] and
- * the allocated hdr_cap struct into arg->act.p[1].
+ * the allocated hdr_cap struct or the preallocated "id" into arg->act.p[1].
  * It returns 0 on success, < 0 on error.
  */
 int parse_http_req_capture(const char **args, int *orig_arg, struct proxy *px, struct http_req_rule *rule, char **err)
@@ -12426,17 +12571,9 @@ int parse_http_req_capture(const char **args, int *orig_arg, struct proxy *px, s
 			break;
 
 	if (cur_arg < *orig_arg + 3) {
-		memprintf(err, "expects <expression> 'len' <length> ");
+		memprintf(err, "expects <expression> [ 'len' <length> | id <idx> ]");
 		return -1;
 	}
-
-	if (!(px->cap & PR_CAP_FE)) {
-		memprintf(err, "proxy '%s' has no frontend capability", px->id);
-		return -1;
-	}
-
-	LIST_INIT((struct list *)&rule->arg.act.p[0]);
-	proxy->conf.args.ctx = ARGC_CAP;
 
 	cur_arg = *orig_arg;
 	expr = sample_parse_expr((char **)args, &cur_arg, px->conf.args.file, px->conf.args.line, err, &px->conf.args);
@@ -12451,8 +12588,22 @@ int parse_http_req_capture(const char **args, int *orig_arg, struct proxy *px, s
 		return -1;
 	}
 
+	if (!args[cur_arg] || !*args[cur_arg]) {
+		memprintf(err, "expects 'len or 'id'");
+		free(expr);
+		return -1;
+	}
+
 	if (strcmp(args[cur_arg], "len") == 0) {
 		cur_arg++;
+
+		if (!(px->cap & PR_CAP_FE)) {
+			memprintf(err, "proxy '%s' has no frontend capability", px->id);
+			return -1;
+		}
+
+		proxy->conf.args.ctx = ARGC_CAP;
+
 		if (!args[cur_arg]) {
 			memprintf(err, "missing length value");
 			free(expr);
@@ -12466,30 +12617,181 @@ int parse_http_req_capture(const char **args, int *orig_arg, struct proxy *px, s
 			return -1;
 		}
 		cur_arg++;
+
+		if (!len) {
+			memprintf(err, "a positive 'len' argument is mandatory");
+			free(expr);
+			return -1;
+		}
+
+		hdr = calloc(sizeof(struct cap_hdr), 1);
+		hdr->next = px->req_cap;
+		hdr->name = NULL; /* not a header capture */
+		hdr->namelen = 0;
+		hdr->len = len;
+		hdr->pool = create_pool("caphdr", hdr->len + 1, MEM_F_SHARED);
+		hdr->index = px->nb_req_cap++;
+
+		px->req_cap = hdr;
+		px->to_log |= LW_REQHDR;
+
+		rule->action       = HTTP_REQ_ACT_CUSTOM_CONT;
+		rule->action_ptr   = http_action_req_capture;
+		rule->arg.act.p[0] = expr;
+		rule->arg.act.p[1] = hdr;
 	}
 
-	if (!len) {
-		memprintf(err, "a positive 'len' argument is mandatory");
+	else if (strcmp(args[cur_arg], "id") == 0) {
+		int id;
+		char *error;
+
+		cur_arg++;
+
+		if (!args[cur_arg]) {
+			memprintf(err, "missing id value");
+			free(expr);
+			return -1;
+		}
+
+		id = strtol(args[cur_arg], &error, 10);
+		if (*error != '\0') {
+			memprintf(err, "cannot parse id '%s'", args[cur_arg]);
+			free(expr);
+			return -1;
+		}
+		cur_arg++;
+
+		proxy->conf.args.ctx = ARGC_CAP;
+
+		rule->action       = HTTP_REQ_ACT_CUSTOM_CONT;
+		rule->action_ptr   = http_action_req_capture_by_id;
+		rule->arg.act.p[0] = expr;
+		rule->arg.act.p[1] = (void *)(long)id;
+	}
+
+	else {
+		memprintf(err, "expects 'len' or 'id', found '%s'", args[cur_arg]);
 		free(expr);
 		return -1;
 	}
 
+	*orig_arg = cur_arg;
+	return 0;
+}
 
-	hdr = calloc(sizeof(struct cap_hdr), 1);
-	hdr->next = px->req_cap;
-	hdr->name = NULL; /* not a header capture */
-	hdr->namelen = 0;
-	hdr->len = len;
-	hdr->pool = create_pool("caphdr", hdr->len + 1, MEM_F_SHARED);
-	hdr->index = px->nb_req_cap++;
+/* This function executes the "capture" action and store the result in a
+ * capture slot if exists. It executes a fetch expression, turns the result
+ * into a string and puts it in a capture slot. It always returns 1. If an
+ * error occurs the action is cancelled, but the rule processing continues.
+ */
+int http_action_res_capture_by_id(struct http_res_rule *rule, struct proxy *px, struct stream *s)
+{
+	struct session *sess = s->sess;
+	struct sample *key;
+	struct sample_expr *expr = rule->arg.act.p[0];
+	struct cap_hdr *h;
+	int idx = (long)rule->arg.act.p[1];
+	char **cap = s->res_cap;
+	struct proxy *fe = strm_fe(s);
+	int len;
+	int i;
 
-	px->req_cap = hdr;
-	px->to_log |= LW_REQHDR;
+	/* Look for the original configuration. */
+	for (h = fe->rsp_cap, i = fe->nb_rsp_cap - 1;
+	     h != NULL && i != idx ;
+	     i--, h = h->next);
+	if (!h)
+		return 1;
 
-	rule->action       = HTTP_REQ_ACT_CUSTOM_CONT;
-	rule->action_ptr   = http_action_req_capture;
+	key = sample_fetch_string(s->be, sess, s, SMP_OPT_DIR_RES|SMP_OPT_FINAL, expr);
+	if (!key)
+		return 1;
+
+	if (cap[h->index] == NULL)
+		cap[h->index] = pool_alloc2(h->pool);
+
+	if (cap[h->index] == NULL) /* no more capture memory */
+		return 1;
+
+	len = key->data.str.len;
+	if (len > h->len)
+		len = h->len;
+
+	memcpy(cap[h->index], key->data.str.str, len);
+	cap[h->index][len] = 0;
+	return 1;
+}
+
+/* parse an "http-response capture" action. It takes a single argument which is
+ * a sample fetch expression. It stores the expression into arg->act.p[0] and
+ * the allocated hdr_cap struct od the preallocated id into arg->act.p[1].
+ * It returns 0 on success, < 0 on error.
+ */
+int parse_http_res_capture(const char **args, int *orig_arg, struct proxy *px, struct http_res_rule *rule, char **err)
+{
+	struct sample_expr *expr;
+	int cur_arg;
+	int id;
+	char *error;
+
+	for (cur_arg = *orig_arg; cur_arg < *orig_arg + 3 && *args[cur_arg]; cur_arg++)
+		if (strcmp(args[cur_arg], "if") == 0 ||
+		    strcmp(args[cur_arg], "unless") == 0)
+			break;
+
+	if (cur_arg < *orig_arg + 3) {
+		memprintf(err, "expects <expression> [ 'len' <length> | id <idx> ]");
+		return -1;
+	}
+
+	cur_arg = *orig_arg;
+	expr = sample_parse_expr((char **)args, &cur_arg, px->conf.args.file, px->conf.args.line, err, &px->conf.args);
+	if (!expr)
+		return -1;
+
+	if (!(expr->fetch->val & SMP_VAL_FE_HRS_HDR)) {
+		memprintf(err,
+			  "fetch method '%s' extracts information from '%s', none of which is available here",
+			  args[cur_arg-1], sample_src_names(expr->fetch->use));
+		free(expr);
+		return -1;
+	}
+
+	if (!args[cur_arg] || !*args[cur_arg]) {
+		memprintf(err, "expects 'len or 'id'");
+		free(expr);
+		return -1;
+	}
+
+	if (strcmp(args[cur_arg], "id") != 0) {
+		memprintf(err, "expects 'id', found '%s'", args[cur_arg]);
+		free(expr);
+		return -1;
+	}
+
+	cur_arg++;
+
+	if (!args[cur_arg]) {
+		memprintf(err, "missing id value");
+		free(expr);
+		return -1;
+	}
+
+	id = strtol(args[cur_arg], &error, 10);
+	if (*error != '\0') {
+		memprintf(err, "cannot parse id '%s'", args[cur_arg]);
+		free(expr);
+		return -1;
+	}
+	cur_arg++;
+
+	LIST_INIT((struct list *)&rule->arg.act.p[0]);
+	proxy->conf.args.ctx = ARGC_CAP;
+
+	rule->action       = HTTP_RES_ACT_CUSTOM_CONT;
+	rule->action_ptr   = http_action_res_capture_by_id;
 	rule->arg.act.p[0] = expr;
-	rule->arg.act.p[1] = hdr;
+	rule->arg.act.p[1] = (void *)(long)id;
 
 	*orig_arg = cur_arg;
 	return 0;
@@ -12748,9 +13050,12 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "http_date", sample_conv_http_date,  ARG1(0,SINT),     NULL, SMP_T_UINT, SMP_T_STR},
 	{ "language",  sample_conv_q_prefered, ARG2(1,STR,STR),  NULL, SMP_T_STR,  SMP_T_STR},
+	{ "capture-req", smp_conv_req_capture, ARG1(1,UINT),     NULL, SMP_T_STR,  SMP_T_STR},
+	{ "capture-res", smp_conv_res_capture, ARG1(1,UINT),     NULL, SMP_T_STR,  SMP_T_STR},
 	{ "url_dec",   sample_conv_url_dec,    0,                NULL, SMP_T_STR,  SMP_T_STR},
 	{ NULL, NULL, 0, 0, 0 },
 }};
+
 
 /************************************************************************/
 /*   All supported http-request action keywords must be declared here.  */
@@ -12767,6 +13072,14 @@ struct http_req_action_kw_list http_req_actions = {
 	}
 };
 
+struct http_res_action_kw_list http_res_actions = {
+	.scope = "http",
+	.kw = {
+		{ "capture",    parse_http_res_capture },
+		{ NULL, NULL }
+	}
+};
+
 __attribute__((constructor))
 static void __http_protocol_init(void)
 {
@@ -12774,6 +13087,7 @@ static void __http_protocol_init(void)
 	sample_register_fetches(&sample_fetch_keywords);
 	sample_register_convs(&sample_conv_kws);
 	http_req_keywords_register(&http_req_actions);
+	http_res_keywords_register(&http_res_actions);
 }
 
 

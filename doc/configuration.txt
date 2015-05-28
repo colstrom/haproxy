@@ -1393,7 +1393,7 @@ mailer <mailername> <ip>:<port>
 ----------
 
 Proxy configuration can be located in a set of sections :
- - defaults <name>
+ - defaults [<name>]
  - frontend <name>
  - backend  <name>
  - listen   <name>
@@ -1504,6 +1504,7 @@ clitimeout                  (deprecated)  X          X         X         -
 compression                               X          X         X         X
 contimeout                  (deprecated)  X          -         X         X
 cookie                                    X          -         X         X
+declare capture                           -          X         X         -
 default-server                            X          -         X         X
 default_backend                           X          X         X         -
 description                               -          X         X         X
@@ -1608,12 +1609,10 @@ reqidel                                   -          X         X         X
 reqideny                                  -          X         X         X
 reqipass                                  -          X         X         X
 reqirep                                   -          X         X         X
-reqisetbe                                 -          X         X         X
 reqitarpit                                -          X         X         X
 reqpass                                   -          X         X         X
 reqrep                                    -          X         X         X
 -- keyword -------------------------- defaults - frontend - listen -- backend -
-reqsetbe                                  -          X         X         X
 reqtarpit                                 -          X         X         X
 retries                                   X          -         X         X
 rspadd                                    -          X         X         X
@@ -2621,6 +2620,22 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
              and "ignore-persist".
 
 
+declare capture [ request | response ] len <length>
+  Declares a capture slot.
+  May be used in sections :   defaults | frontend | listen | backend
+                                 no    |    yes   |   yes  |   no
+  Arguments:
+    <length> is the length allowed for the capture.
+
+  This declaration is only available in the frontend or listen section, but the
+  reserved slot can be used in the backends. The "request" keyword allocates a
+  capture slot for use in the request, and "response" allocates a capture slot
+  for use in the response.
+
+  See also: "capture-req", "capture-res" (sample converters),
+            "http-request capture" and "http-response capture".
+
+
 default-server [param*]
   Change default options for a server in a backend
   May be used in sections :   defaults | frontend | listen | backend
@@ -2655,7 +2670,7 @@ default_backend <backend>
         use_backend     static   if  url_css url_img extension_img
         default_backend dynamic
 
-  See also : "use_backend", "reqsetbe", "reqisetbe"
+  See also : "use_backend"
 
 
 description <string>
@@ -3263,7 +3278,7 @@ http-check send-state
 
 http-request { allow | deny | tarpit | auth [realm <realm>] | redirect <rule> |
               add-header <name> <fmt> | set-header <name> <fmt> |
-              capture <sample> len <length> |
+              capture <sample> [ len <length> | id <id> ] |
               del-header <name> | set-nice <nice> | set-log-level <level> |
               replace-header <name> <match-regex> <replace-fmt> |
               replace-value <name> <match-regex> <replace-fmt> |
@@ -3482,7 +3497,7 @@ http-request { allow | deny | tarpit | auth [realm <realm>] | redirect <rule> |
       with large lists! It is the equivalent of the "set map" command from the
       stats socket, but can be triggered by an HTTP request.
 
-    - capture <sample> len <length> :
+    - capture <sample> [ len <length> | id <id> ] :
       captures sample expression <sample> from the request buffer, and converts
       it to a string of at most <len> characters. The resulting string is
       stored into the next request "capture" slot, so it will possibly appear
@@ -3492,6 +3507,11 @@ http-request { allow | deny | tarpit | auth [realm <realm>] | redirect <rule> |
       that this size will be allocated for each capture during the whole
       session life. Please check section 7.3 (Fetching samples) and "capture
       request header" for more information.
+
+      If the keyword "id" is used instead of "len", the action tries to store
+      the captured string in a previously declared capture slot. This is useful
+      to run captures in backends. The slot id can be declared by a previous
+      directive "http-request capture" or with the "declare capture" keyword.
 
     - { track-sc0 | track-sc1 | track-sc2 } <key> [table <table>] :
       enables tracking of sticky counters from current request. These rules
@@ -3592,6 +3612,7 @@ http-request { allow | deny | tarpit | auth [realm <realm>] | redirect <rule> |
              about ACL usage.
 
 http-response { allow | deny | add-header <name> <fmt> | set-nice <nice> |
+                capture <sample> id <id> | redirect <rule> |
                 set-header <name> <fmt> | del-header <name> |
                 replace-header <name> <regex-match> <replace-fmt> |
                 replace-value <name> <regex-match> <replace-fmt> |
@@ -3751,6 +3772,28 @@ http-response { allow | deny | add-header <name> <fmt> | set-nice <nice> |
     - "lua" is used to run a Lua function if the action is executed. The single
       parameter is the name of the function to run. The prototype of the
       function is documented in the API documentation.
+
+    - capture <sample> id <id> :
+      captures sample expression <sample> from the response buffer, and converts
+      it to a string. The resulting string is stored into the next request
+      "capture" slot, so it will possibly appear next to some captured HTTP
+      headers. It will then automatically appear in the logs, and it will be
+      possible to extract it using sample fetch rules to feed it into headers or
+      anything. Please check section 7.3 (Fetching samples) and "capture
+      response header" for more information.
+
+      The keyword "id" is the id of the capture slot which is used for storing
+      the string. The capture slot must be defined in an associated frontend.
+      This is useful to run captures in backends. The slot id can be declared by
+      a previous directive "http-response capture" or with the "declare capture"
+      keyword.
+
+    - "redirect" : this performs an HTTP redirection based on a redirect rule.
+      This supports a format string similarly to "http-request redirect" rules,
+      with the exception that only the "location" type of redirect is possible
+      on the response. See the "redirect" keyword for the rule's syntax. When
+      a redirect rule is applied during a response, connections to the server
+      are closed so that no data can be forwarded from the server to the client.
 
   There is no limit to the number of http-response statements per instance.
 
@@ -10904,6 +10947,22 @@ regsub(<regex>,<subst>[,<flags>])
      # output: x-path: /a/b/c/xzxyz/
      http-request set-header x-path %[hdr(x-path),regsub(/+,/,g)]
 
+capture-req(<id>)
+  Capture the string entry in the request slot <id> and returns the entry as
+  is. If the slot doesn't exist, the capture fails silently.
+
+  See also: "declare capture", "http-request capture",
+            "http-response capture", "req.hdr.capture" and
+            "res.hdr.capture" (sample fetches).
+
+capture-res(<id>)
+  Capture the string entry in the response slot <id> and returns the entry as
+  is. If the slot doesn't exist, the capture fails silently.
+
+  See also: "declare capture", "http-request capture",
+            "http-response capture", "req.hdr.capture" and
+            "res.hdr.capture" (sample fetches).
+
 sdbm([<avalanche>])
   Hashes a binary input sample into an unsigned 32-bit quantity using the SDBM
   hash function. Optionally, it is possible to apply a full avalanche hash
@@ -14303,9 +14362,9 @@ S (Servers).
      server. The server value counts the number of times that server was
      switched away from.
  17. status [LFBS]: status (UP/DOWN/NOLB/MAINT/MAINT(via)...)
- 18. weight [..BS]: server weight (server), total weight (backend)
- 19. act [..BS]: server is active (server), number of active servers (backend)
- 20. bck [..BS]: server is backup (server), number of backup servers (backend)
+ 18. weight [..BS]: total weight (backend), server weight (server)
+ 19. act [..BS]: number of active servers (backend), server is active (server)
+ 20. bck [..BS]: number of backup servers (backend), server is backup (server)
  21. chkfail [...S]: number of failed checks. (Only counts checks failed when
      the server is up.)
  22. chkdown [..BS]: number of UP->DOWN transitions. The backend counter counts
