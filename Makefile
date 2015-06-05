@@ -38,6 +38,8 @@
 #   USE_TFO              : enable TCP fast open. Supported on Linux >= 3.7.
 #   USE_NS               : enable network namespace support. Supported on Linux >= 2.6.24.
 #   USE_DL               : enable it if your system requires -ldl. Automatic on Linux.
+#   USE_DEVICEATLAS      : enable DeviceAtlas api.
+#   USE_51DEGREES        : enable third party device detection library from 51degrees
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -600,6 +602,30 @@ OPTIONS_LDFLAGS += $(LUA_LD_FLAGS) -l$(LUA_LIB_NAME) -lm
 OPTIONS_OBJS    += src/hlua.o
 endif
 
+ifneq ($(USE_DEVICEATLAS),)
+# Use DEVICEATLAS_SRC and possibly DEVICEATLAS_INC and DEVICEATLAS_LIB to force path
+# to 51degrees headers and libraries if needed.
+DEVICEATLAS_SRC =
+DEVICEATLAS_INC = $(DEVICEATLAS_SRC)
+DEVICEATLAS_LIB = $(DEVICEATLAS_SRC)
+OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/json.o
+OPTIONS_OBJS	+= $(DEVICEATLAS_LIB)/dac.o
+OPTIONS_OBJS	+= src/da.o
+OPTIONS_CFLAGS += -DUSE_DEVICEATLAS $(if $(DEVICEATLAS_INC),-I$(DEVICEATLAS_INC))
+BUILD_OPTIONS  += $(call ignore_implicit,USE_DEVICEATLAS)
+endif
+
+ifneq ($(USE_51DEGREES),)
+# Use 51DEGREES_SRC and possibly 51DEGREES_INC and 51DEGREES_LIB to force path
+# to 51degrees headers and libraries if needed.
+51DEGREES_SRC =
+51DEGREES_INC = $(51DEGREES_SRC)
+51DEGREES_LIB = $(51DEGREES_SRC)
+OPTIONS_CFLAGS  += -DUSE_51DEGREES $(if $(51DEGREES_INC),-I$(51DEGREES_INC))
+BUILD_OPTIONS   += $(call ignore_implicit,USE_51DEGREES)
+OPTIONS_LDFLAGS += $(if $(51DEGREES_LIB),-L$(51DEGREES_LIB)) -lz
+endif
+
 ifneq ($(USE_PCRE)$(USE_STATIC_PCRE)$(USE_PCRE_JIT),)
 # PCREDIR is used to automatically construct the PCRE_INC and PCRE_LIB paths,
 # by appending /include and /lib respectively. If your system does not use the
@@ -716,6 +742,10 @@ EBTREE_OBJS = $(EBTREE_DIR)/ebtree.o \
 
 ifneq ($(TRACE),)
 OBJS += src/trace.o
+endif
+
+ifneq ($(USE_51DEGREES),)
+OBJS += $(51DEGREES_SRC)/51Degrees.o
 endif
 
 WRAPPER_OBJS = src/haproxy-systemd-wrapper.o

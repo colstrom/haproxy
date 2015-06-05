@@ -26,10 +26,15 @@
 
 #include <common/config.h>
 #include <common/standard.h>
+#include <import/da.h>
 #include <types/freq_ctr.h>
 #include <types/listener.h>
 #include <types/proxy.h>
 #include <types/task.h>
+
+#ifdef USE_51DEGREES
+#include <51Degrees.h>
+#endif
 
 #ifndef UNIX_MAX_PATH
 #define UNIX_MAX_PATH 108
@@ -169,7 +174,34 @@ struct global {
 	unsigned long cpu_map[LONGBITS];  /* list of CPU masks for the 32/64 first processes */
 #endif
 	struct proxy *stats_fe;     /* the frontend holding the stats settings */
+#ifdef USE_DEVICEATLAS
+	struct {
+		void *atlasimgptr;
+		char *jsonpath;
+		da_atlas_t atlas;
+		da_evidence_id_t useragentid;
+		da_severity_t loglevel;
+		char separator;
+	} deviceatlas;
+#endif
+
+#ifdef USE_51DEGREES
+	char _51d_property_seperator;    /* the seperator to use in the response for the values. this is taken from 51degrees-property-seperator from config. */
+	struct list _51d_property_names; /* list of properties to load into the data set. this is taken from 51degrees-property-name-list from config. */
+	char * _51d_data_file_path;
+#ifdef FIFTYONEDEGREES_H_PATTERN_INCLUDED
+	fiftyoneDegreesDataSet _51d_data_set; /* data set used with the pattern detection method. */
+#endif
+
+#endif
 };
+
+#ifdef USE_51DEGREES
+struct _51d_property_names {
+	struct list list;
+	char *name;
+};
+#endif
 
 extern struct global global;
 extern int  pid;                /* current process id */

@@ -753,6 +753,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		}
 		global.tune.ssl_max_record = atol(args[1]);
 	}
+#ifndef OPENSSL_NO_DH
 	else if (!strcmp(args[0], "tune.ssl.default-dh-param")) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
@@ -768,6 +769,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 	}
+#endif
 #endif
 	else if (!strcmp(args[0], "tune.buffers.limit")) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
@@ -1187,6 +1189,22 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		goto out;
 #endif
 	}
+#ifdef USE_OPENSSL
+#ifndef OPENSSL_NO_DH
+	else if (!strcmp(args[0], "ssl-dh-param-file")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a file path as an argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (ssl_sock_load_global_dh_param_from_file(args[1])) {
+			Alert("parsing [%s:%d] : '%s': unable to load DH parameters from file <%s>.\n", file, linenum, args[0], args[1]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+	}
+#endif
+#endif
 	else if (!strcmp(args[0], "ssl-server-verify")) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
@@ -1731,6 +1749,48 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		goto out;
 #endif
 	}
+#ifdef USE_51DEGREES
+	else if (strcmp(args[0], "51degrees-data-file") == 0) {
+		if(!*(args[1])) {
+			Alert("parsing [%s:%d]: '%s' expects a filepath to a 51Degrees trie or pattern data file.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global._51d_data_file_path = strdup(args[1]);
+	}
+	else if (strcmp(args[0], "51degrees-property-seperator") == 0) {
+		if(!*(args[1])) {
+			Alert("parsing [%s:%d]: '%s' expects a single character.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		if (strlen(args[1]) > 1) {
+			Alert("parsing [%s:%d]: '%s' expects a single character, got '%s'.\n", file, linenum, args[0], args[1]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global._51d_property_seperator = *args[1];
+	}
+	else if (strcmp(args[0], "51degrees-property-name-list") == 0) {
+		int arg;
+		struct _51d_property_names *name;
+
+		arg = 1;
+		if (!*args[arg]) {
+			Alert("parsing [%s:%d]: '%s' expects at least one 51Degrees property name.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		LIST_INIT(&global._51d_property_names);
+		while (*args[arg]) {
+			name = calloc(1, sizeof(struct _51d_property_names));
+			name->name = strdup(args[arg]);
+			LIST_ADDQ(&global._51d_property_names, &name->list);
+			++arg;
+		}
+	}
+#endif
 	else {
 		struct cfg_kw_list *kwl;
 		int index;
@@ -1986,7 +2046,6 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		curpeers->count++;
 		newpeer->next = curpeers->remote;
 		curpeers->remote = newpeer;
-		newpeer->peers = curpeers;
 		newpeer->conf.file = strdup(file);
 		newpeer->conf.line = linenum;
 
@@ -2030,6 +2089,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		if (strcmp(newpeer->id, localpeer) == 0) {
 			/* Current is local peer, it define a frontend */
 			newpeer->local = 1;
+			peers->local = newpeer;
 
 			if (!curpeers->peers_fe) {
 				if ((curpeers->peers_fe  = calloc(1, sizeof(struct proxy))) == NULL) {
@@ -8397,6 +8457,7 @@ out_uri_auth_compat:
 				curpeers->peers_fe = NULL;
 			}
 			else {
+				peers_init_sync(curpeers);
 				last = &curpeers->next;
 				continue;
 			}
